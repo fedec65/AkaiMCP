@@ -1,0 +1,16 @@
+[project]
+name = "mpc-sdk-mcp"
+version = "0.1.0"
+description = "MCP server that drives the MPC Plugin SDK (scaffold, build, test, package, deploy) from Claude Desktop"
+requires-python = ">=3.10"
+license = { text = "AGPL-3.0-only" }
+dependencies = [
+    "mcp>=1.8,<2",
+    "jsonschema>=4",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
