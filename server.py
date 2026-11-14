@@ -25,7 +25,7 @@ from mcp.server.fastmcp import FastMCP  # noqa: E402
 from mcp.server.fastmcp.resources import FunctionResource  # noqa: E402
 
 import sdk_paths as sp  # noqa: E402
-from jobs import JobLimitError, JobManager  # noqa: E402
+from jobs import MAX_CONCURRENT as MAX_JOBS, JobLimitError, JobManager  # noqa: E402
 
 MAX_OUTPUT = 20 * 1024
 SYNC_TIMEOUT = 300
@@ -191,32 +191,59 @@ def save_state(state: dict) -> None:
     os.replace(tmp, _state_file())
 
 
-def last_good_build(project: Path) -> Optional[dict]:
-    """Newest finished full (arm32 + arm64) build job for this project that succeeded."""
-    best = None
+def bump_output_gen(project: Path) -> int:
+    """Record that something is about to rewrite the project's build output. Returns the new generation."""
+    st = load_state()
+    gens = st.setdefault("output_gen", {})
+    gens[str(project)] = int(gens.get(str(project), 0)) + 1
+    save_state(st)
+    return gens[str(project)]
+
+
+def output_gen(project: Path) -> int:
+    return int(load_state().get("output_gen", {}).get(str(project), 0))
+
+
+def last_build_attempt(project: Path) -> Optional[dict]:
+    """Newest build job for this project, whatever its target or outcome (every build rewrites build/)."""
+    last = None
     for rec in jobs().all_records():
-        if rec.get("kind") != "build" or rec.get("project") != str(project) or rec.get("target") != "all":
-            continue
-        if jobs().state(rec)["state"] == "succeeded":
-            best = rec
-    return best
+        if rec.get("kind") == "build" and rec.get("project") == str(project):
+            last = rec
+    return last
 
 
 def deploy_gate(project: Path) -> Optional[str]:
-    """Returns None when deploying is allowed, else the reason it is refused."""
+    """Returns None when deploying is allowed, else the reason it is refused.
+
+    Allowed only when the newest build attempt is a finished, successful full build of the current files, and
+    the output folder has not been rewritten since it was last validated (by that build or by validate).
+    """
     fp = sp.fingerprint(project)
     v = load_state().get("validate", {}).get(str(project))
     if not v or v.get("fingerprint") != fp:
         return ("no successful validate for the current files. Run validate (and build) again after the last edit.")
-    b = last_good_build(project)
+    b = last_build_attempt(project)
     if not b:
         return "no successful full build (arm32 + arm64). Run build and wait for job_status to say succeeded."
+    state = jobs().state(b)["state"]
+    if state == "running":
+        return "a build is still running (job %s); wait for it to finish." % b["id"]
+    if b.get("target") != "all":
+        return ("the last build (job %s) was a single-target build; run a full build (arm32 + arm64)." % b["id"])
+    if state != "succeeded":
+        return ("the last build (job %s) %s, so the output folder may be incomplete. Rebuild until it succeeds."
+                % (b["id"], state))
     if b.get("fingerprint") != fp:
         return ("files changed after the last successful build (job %s). Rebuild, then validate, before deploying."
                 % b["id"])
+    cur = output_gen(project)
+    if b.get("output_gen") != cur and not (v.get("built") and v.get("output_gen") == cur):
+        return ("the build output was changed after the build (for example by generate_ui). Run validate on it "
+                "again before deploying.")
     paths = project_paths(project)
-    if not paths["out_dir"].is_dir():
-        return "the build output folder %s is missing; rebuild." % paths["out_dir"]
+    if not paths["out_dir"].is_dir() or not (paths["out_dir"] / "VST").is_dir():
+        return "the build output folder %s is missing or incomplete; rebuild." % paths["out_dir"]
     return None
 
 
@@ -379,6 +406,8 @@ def schema_check(project: Path) -> List[str]:
         except ValueError as e:
             problems.append("%s is not valid JSON: %s" % (fname, e))
             continue
+        if fname == "plugin.json" and isinstance(data, dict):
+            problems.extend(sp.binary_path_problems(data))
         schema_path = sp.sdk_root() / "schemas" / schema_name
         if not schema_path.is_file():
             continue
@@ -404,6 +433,7 @@ async def validate(plugin: str) -> dict:
     """
     project = sp.resolve_plugin(plugin)
     fp_before = sp.fingerprint(project)
+    gen_before = output_gen(project)
     problems = schema_check(project)
     paths = project_paths(project) if (project / "plugin.json").is_file() and not problems else None
     r = result(not problems, 0 if not problems else 1, stdout="", stderr="\n".join(problems),
@@ -416,10 +446,11 @@ async def validate(plugin: str) -> dict:
     else:
         r["note"] = ("source files only: no build output yet. build runs the full validator on the output folder; "
                      "run validate again after a build before deploying.")
-    if r["ok"] and sp.fingerprint(project) == fp_before:
+    if r["ok"] and sp.fingerprint(project) == fp_before and output_gen(project) == gen_before:
         st = load_state()
         st.setdefault("validate", {})[str(project)] = {"fingerprint": fp_before, "at": time.time(),
-                                                        "built": "validated_build" in r}
+                                                        "built": "validated_build" in r,
+                                                        "output_gen": gen_before}
         save_state(st)
     return r
 
@@ -440,6 +471,7 @@ async def generate_ui(plugin: str) -> dict:
             "--out", str(pp["out_dir"] / "Plugin Skins"), "--kit-cache", str(pp["build"])]
     if (project / "ui.json").is_file():
         argv += ["--ui", str(project / "ui.json")]
+    bump_output_gen(project)  # the output folder changes: validate it again before any deploy
     r = await run_sdk_async(argv, "gen_ui", cwd=project)
     if r["ok"]:
         r["paths"] = [sp.rel_to_workspace(pp["out_dir"] / "Plugin Skins")]
@@ -452,11 +484,16 @@ def build(plugin: str, targets: Optional[List[str]] = None) -> dict:
     """Start tools/build.py as a background job and return its job_id. Poll with job_status.
 
     targets: ["arm32", "arm64"] (default, both MPC CPU families plus the native test build and output
-    folder), ["arm32"] or ["arm64"] alone, or ["native"] for only the native build used by test_host_sim.
-    The first build downloads the Zig cross compiler and can take several minutes.
+    folder), ["arm32"] or ["arm64"] alone (a quick compile check: the SDK validator is skipped because the
+    other binary is missing, and the result cannot be installed), or ["native"] for only the native build
+    used by test_host_sim. The first build downloads the Zig cross compiler and can take several minutes.
     """
     project = sp.resolve_plugin(plugin)
-    sp.load_manifest(project)
+    manifest = sp.load_manifest(project)
+    bad_paths = sp.binary_path_problems(manifest)
+    if bad_paths:
+        return error("not built: " + "; ".join(bad_paths) +
+                     '. Use paths such as "VST/<slug>-arm32.so" inside the plugin folder.')
     t = sorted(set(targets or ["arm32", "arm64"]))
     if t == ["arm32", "arm64"]:
         target = "all"
@@ -464,11 +501,20 @@ def build(plugin: str, targets: Optional[List[str]] = None) -> dict:
         target = t[0]
     else:
         raise sp.SandboxError('targets must be ["arm32", "arm64"], ["arm32"], ["arm64"] or ["native"]')
+    prev = last_build_attempt(project)
+    if prev and jobs().state(prev)["state"] == "running":
+        return error("a build of this plugin is already running (job %s); wait for it or job_cancel it" % prev["id"])
     argv = [sp.python_exe(), script("build.py"), str(project), "--target", target]
+    if target in ("arm32", "arm64"):
+        argv.append("--no-validate")
     try:
+        if jobs().running_count() >= MAX_JOBS:
+            raise JobLimitError("%d jobs are already running; wait for one to finish or cancel it with job_cancel"
+                                % MAX_JOBS)
+        gen = bump_output_gen(project)
         rec = jobs().start("build", argv, str(project), child_env(),
                            meta={"project": str(project), "plugin": plugin, "target": target,
-                                 "fingerprint": sp.fingerprint(project)})
+                                 "fingerprint": sp.fingerprint(project), "output_gen": gen})
     except JobLimitError as e:
         return error(str(e))
     zig = (sp.sdk_root() / ".sdk-tools" / "zigenv").is_dir()
@@ -632,12 +678,15 @@ async def mpc_install(plugin: str, confirm: bool = False, drive: Optional[str] =
     reason = deploy_gate(project)
     if reason:
         return error("not deployed: " + reason)
+    out_dir = project_paths(project)["out_dir"]
     argv = _mpc_argv("update" if replace else "add", drive)
-    argv.insert(4, str(project))
+    # Pass the one output folder the gate checked: given the project folder, mpc_remote.py would install
+    # every built folder under build/, including stale ones left by an earlier name or manufacturer.
+    argv.insert(4, str(out_dir))
     if replace:
         argv.append("--yes")
     r = await run_sdk_async(argv, "mpc_install", timeout=600, extra_env=MPC_ENV_ALLOWLIST)
-    folder = project_paths(project)["out_dir"].name
+    folder = out_dir.name
     left_alone = "Left" in r["stdout"] and "alone" in r["stdout"]
     r["changed"] = (("installed '%s' into 'VST2 Plugins'" % folder) if r["ok"] and not left_alone
                     else "nothing changed on the device")

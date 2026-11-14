@@ -215,7 +215,7 @@ Desktop. The installer writes `MPC_HOST` (with `--mpc-host`) and `WORKSPACE` (wi
 | `list_plugin_files`, `read_plugin_file`, `write_plugin_file` | - | limited to the plugin's folder; writes `.cpp .h .hpp .json .md` only, 512 KB max; `build/` and the examples are read-only |
 | `validate(plugin)` | `schemas/`, `tools/validate.py` | checks `plugin.json` and `ui.json` against the schemas, and the build output if there is one |
 | `generate_ui(plugin)` | `tools/gen_ui.py` | redo the touch-screen layout without recompiling (needs a previous build) |
-| `build(plugin, targets)` | `tools/build.py` | background job; both MPC processors by default |
+| `build(plugin, targets)` | `tools/build.py` | background job; both MPC processors by default. `["arm32"]` or `["arm64"]` alone is a quick compile check: it skips the SDK validator and can't be installed. Refused if `file32`/`file64` in `plugin.json` point outside the plugin folder, or if a build of the same plugin is already running |
 | `test_host_sim(plugin, notes, seconds, playing)` | the SDK host simulator | background job; result pass / FAIL / crash, and `build/test.wav` |
 | `package(plugin)` | `tools/package.py` | zip with install instructions, for sharing |
 | `job_status(job_id, tail)`, `job_cancel(job_id)` | - | progress and log of a background job; no id lists recent jobs |
@@ -236,8 +236,14 @@ the source's licence and credit its author), `deploy_to_mpc` (a step-by-step saf
 
 ### Install rules
 
-- `mpc_install` is refused unless `confirm=true` **and** both `validate` and a full build (both MPC processors)
-  succeeded on the current files. Any edit after either one blocks the install until both run again.
+- `mpc_install` is refused unless `confirm=true` **and** `validate` passed on the current files **and** the
+  most recent build attempt is a finished, successful full build (both MPC processors) of those same files.
+  Any edit after either one blocks the install until both run again.
+- A newer build that failed, was cancelled, is still running or built only one processor blocks the install,
+  even if an earlier build succeeded: it may have left the output folder half-written.
+- After `generate_ui` rewrites the output folder, run `validate` again before installing.
+- Only the current output folder is sent to the MPC. Older folders left in `build/` (after renaming the plugin
+  or changing the manufacturer) are never uploaded.
 - Nothing installs automatically after a build.
 - An already installed copy is replaced only with `replace=true`.
 - Results say what changed on the MPC and how to recover.
@@ -247,6 +253,8 @@ the source's licence and credit its author), `deploy_to_mpc` (a step-by-step saf
 `build` and `test_host_sim` run as separate processes and return a job id at once. Each job logs to
 `.mpc-mcp/jobs/<id>.log` and records its exit code when it finishes. A job keeps running if Claude Desktop
 disconnects or restarts, and `job_status` still works afterwards. At most 2 jobs run at a time.
+`job_cancel` stops the job's whole process group: it waits for every process to end and force-kills any that
+ignore the stop signal.
 
 ## Development
 

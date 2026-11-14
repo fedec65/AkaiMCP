@@ -194,6 +194,26 @@ def output_folder_name(manifest: dict) -> str:
     return "".join(c for c in s if c not in ILLEGAL_FILENAME_CHARS)
 
 
+def binary_path_problems(manifest: dict) -> list:
+    """file32/file64 must stay inside the output folder: tools/build.py compiles straight to these paths."""
+    problems = []
+    for key in ("file32", "file64"):
+        rel = manifest.get(key)
+        if rel is None:
+            continue  # build.py falls back to VST/<slug>-arm32.so / -arm64.so
+        if not isinstance(rel, str) or not rel.strip():
+            problems.append('plugin.json "%s" must be a non-empty relative path' % key)
+            continue
+        norm = rel.replace("\\", "/")
+        if "\x00" in rel or norm.startswith("/") or (len(norm) > 1 and norm[1] == ":"):
+            problems.append('plugin.json "%s" must be relative to the plugin folder, got %r' % (key, rel))
+        elif ".." in norm.split("/"):
+            problems.append('plugin.json "%s" must not contain "..": %r' % (key, rel))
+        elif not norm.lower().endswith(".so"):
+            problems.append('plugin.json "%s" must end in .so: %r' % (key, rel))
+    return problems
+
+
 def rel_to_workspace(p: Path) -> str:
     p = Path(p).resolve()
     for root in (workspace(), sdk_root()):

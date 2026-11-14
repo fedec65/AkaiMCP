@@ -170,6 +170,28 @@ def test_job_survives_manager_restart_and_cancel(env, tmp_path):
 
 # --- deploy gating ---------------------------------------------------------------------------
 
+def fake_build(env, project, code=0, target="all", wait=True):
+    """Record a build job the way server.build does, running a stand-in command instead of build.py."""
+    s = env["server"]
+    (s.project_paths(project)["out_dir"] / "VST").mkdir(parents=True, exist_ok=True)
+    gen = s.bump_output_gen(project)
+    cmd = "import sys, time; time.sleep(30)" if not wait else "import sys; sys.exit(%d)" % code
+    rec = s.jobs().start("build", [sys.executable, "-c", cmd], str(project), dict(os.environ),
+                         meta={"project": str(project), "plugin": project.name, "target": target,
+                               "fingerprint": env["sp"].fingerprint(project), "output_gen": gen})
+    if wait:
+        wait_state(s.jobs(), rec["id"])
+    return rec
+
+
+def mark_validated(env, project, built=False):
+    s = env["server"]
+    st = s.load_state()
+    st.setdefault("validate", {})[str(project)] = {"fingerprint": env["sp"].fingerprint(project),
+                                                   "built": built, "output_gen": s.output_gen(project)}
+    s.save_state(st)
+
+
 def test_deploy_gate(env, monkeypatch):
     s = env["server"]
     project = make_plugin(env)
@@ -180,16 +202,8 @@ def test_deploy_gate(env, monkeypatch):
     assert not r["ok"] and "validate" in r["message"]
 
     # Simulate a finished successful full build and a passing validate on the current files.
-    pp = s.project_paths(project)
-    (pp["out_dir"] / "VST").mkdir(parents=True)
-    jm = s.jobs()
-    rec = jm.start("build", [sys.executable, "-c", "pass"], str(project), dict(os.environ),
-                   meta={"project": str(project), "plugin": "Tape Echo", "target": "all",
-                         "fingerprint": env["sp"].fingerprint(project)})
-    assert wait_state(jm, rec["id"])["state"] == "succeeded"
-    st = s.load_state()
-    st.setdefault("validate", {})[str(project)] = {"fingerprint": env["sp"].fingerprint(project)}
-    s.save_state(st)
+    fake_build(env, project)
+    mark_validated(env, project)
     assert s.deploy_gate(project) is None
 
     time.sleep(0.01)
@@ -203,6 +217,109 @@ def test_deploy_gate(env, monkeypatch):
     assert reason and "changed after the last successful build" in reason
     r = run(s.mpc_install("Tape Echo", confirm=True))
     assert not r["ok"] and "Rebuild" in r["message"]
+
+
+def test_gate_follows_latest_build_attempt(env):
+    """Devin #2: a newer failed, cancelled, single-target or running build closes the gate."""
+    s = env["server"]
+    project = make_plugin(env)
+    fake_build(env, project)
+    mark_validated(env, project)
+    assert s.deploy_gate(project) is None
+
+    fake_build(env, project, code=1)  # same files, but the rebuild failed half-way
+    assert "failed" in s.deploy_gate(project)
+
+    fake_build(env, project, target="arm32")
+    assert "single-target" in s.deploy_gate(project)
+
+    running = fake_build(env, project, wait=False)
+    assert "still running" in s.deploy_gate(project)
+    r = s.build("Tape Echo")
+    assert not r["ok"] and "already running" in r["message"]
+    s.jobs().cancel(running["id"])
+    assert "cancelled" in s.deploy_gate(project)
+
+    fake_build(env, project)
+    assert s.deploy_gate(project) is None
+
+
+def test_generate_ui_after_build_needs_revalidate(env):
+    s = env["server"]
+    project = make_plugin(env)
+    fake_build(env, project)
+    mark_validated(env, project)
+    assert s.deploy_gate(project) is None
+    s.bump_output_gen(project)  # what generate_ui does before rewriting Plugin Skins
+    assert "validate" in s.deploy_gate(project)
+    mark_validated(env, project, built=True)  # validate.py ran on the rewritten output
+    assert s.deploy_gate(project) is None
+
+
+@pytest.mark.parametrize("bad", ["../../other/evil.so", "/tmp/evil.so", "C:/evil.so", "VST/../../x.so",
+                                 "VST\\..\\..\\x.so", "VST/x.dll"])
+def test_build_rejects_escaping_binary_paths(env, bad):
+    """Devin #5: build.py compiles straight to file32/file64, so they must stay in the output folder."""
+    s = env["server"]
+    project = make_plugin(env)
+    m = json.loads((project / "plugin.json").read_text())
+    m["file32"] = bad
+    s.write_plugin_file("Tape Echo", "plugin.json", json.dumps(m))
+    r = s.build("Tape Echo")
+    assert not r["ok"] and "file32" in r["message"] and "job_id" not in r
+    assert any("file32" in p for p in run(s.validate("Tape Echo"))["schema_problems"])
+
+
+def test_install_sends_only_current_output_folder(env, monkeypatch):
+    """Devin #1: stale folders left in build/ by an older name must not be uploaded."""
+    s = env["server"]
+    project = make_plugin(env)
+    (project / "build" / "Old Vendor - VST - Tape Echo" / "VST").mkdir(parents=True)
+    fake_build(env, project)
+    mark_validated(env, project)
+    monkeypatch.setenv("MPC_HOST", "192.0.2.1")
+    seen = {}
+
+    async def fake_run(argv, *a, **k):
+        seen["argv"] = argv
+        return s.result(True, 0, stdout="installed")
+    monkeypatch.setattr(s, "run_sdk_async", fake_run)
+    r = run(s.mpc_install("Tape Echo", confirm=True))
+    assert r["ok"], r
+    out_dir = str(s.project_paths(project)["out_dir"])
+    assert seen["argv"][4] == out_dir
+    assert str(project) not in seen["argv"] and "Old Vendor" not in " ".join(seen["argv"])
+
+
+def test_single_target_build_skips_sdk_validation(env, monkeypatch):
+    """Devin #4: the SDK validator always fails a one-architecture build, so it is skipped there."""
+    s = env["server"]
+    make_plugin(env)
+    calls = []
+    monkeypatch.setattr(s.jobs(), "start", lambda kind, argv, cwd, e, meta=None: calls.append(argv) or
+                        {"id": "x-%d" % len(calls), **(meta or {})})
+    s.build("Tape Echo", ["arm64"])
+    s.build("Tape Echo")
+    assert "--no-validate" in calls[0] and "--no-validate" not in calls[1]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX process groups")
+def test_cancel_kills_children_that_ignore_sigterm(tmp_path):
+    """Devin #3: the whole process group must be gone after job_cancel, not just the wrapper."""
+    import signal
+    from jobs import JobManager
+    jm = JobManager(tmp_path / "jobs")
+    marker = tmp_path / "ready"
+    code = ("import signal, time, pathlib; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+            "pathlib.Path(%r).write_text('1'); time.sleep(60)" % str(marker))
+    rec = jm.start("t", [sys.executable, "-c", code], str(tmp_path), dict(os.environ))
+    deadline = time.time() + 10
+    while not marker.exists() and time.time() < deadline:
+        time.sleep(0.05)
+    assert marker.exists()
+    assert jm.cancel(rec["id"])["state"] == "cancelled"
+    with pytest.raises(ProcessLookupError):
+        os.killpg(rec["pid"], 0)
 
 
 def test_mpc_tools_need_host(env):

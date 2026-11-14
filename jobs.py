@@ -151,13 +151,12 @@ class JobManager:
             if IS_WINDOWS:
                 subprocess.run(["taskkill", "/T", "/F", "/PID", str(pid)], capture_output=True, timeout=30)
             else:
+                # The wrapper leads its own process group (pgid == its pid). Wait for the whole group, not
+                # just the wrapper: a child that ignores SIGTERM outlives it and needs SIGKILL.
                 os.killpg(pid, signal.SIGTERM)
-                for _ in range(50):
-                    if not _pid_alive(pid) or (job_id in self._procs and self._procs[job_id].poll() is not None):
-                        break
-                    time.sleep(0.1)
-                else:
+                if not self._wait_group_gone(job_id, pid, 5.0):
                     os.killpg(pid, signal.SIGKILL)
+                    self._wait_group_gone(job_id, pid, 5.0)
         except (ProcessLookupError, PermissionError, OSError):
             pass
         proc = self._procs.get(job_id)
@@ -167,6 +166,25 @@ class JobManager:
             except subprocess.TimeoutExpired:
                 pass
         return self.state(rec)
+
+    def _wait_group_gone(self, job_id: str, pgid: int, timeout: float) -> bool:
+        """POSIX: True once no process of the group is left (reaping our own wrapper so it is not a zombie)."""
+        deadline = time.time() + timeout
+        while True:
+            proc = self._procs.get(job_id)
+            if proc is not None:
+                proc.poll()
+            else:
+                _pid_alive(pgid)  # reaps the wrapper if it is our child
+            try:
+                os.killpg(pgid, 0)
+            except ProcessLookupError:
+                return True
+            except PermissionError:
+                pass
+            if time.time() >= deadline:
+                return False
+            time.sleep(0.1)
 
     def log_tail(self, job_id: str, lines: int, max_bytes: int) -> str:
         p = self._path(job_id, ".log")
