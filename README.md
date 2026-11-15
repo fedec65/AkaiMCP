@@ -95,8 +95,8 @@ To check that it works, ask: *"Use mpc-sdk to show the SDK info."*
 Without this step you copy plugins over by USB stick or SD card, as described below. To have Claude
 install them directly:
 
-1. On the MPC, open **Preferences → Info**. Tap the version value 3 times, the serial number value 2 times,
-   then the firmware version once. This switches on **developer mode**, which starts the MPC's SSH server.
+1. On the MPC (MPC OS 3.10.1 or later), open **Preferences → Enhancements** and switch on
+   **Developer Panel**. This switches on **developer mode**, which starts the MPC's SSH server.
 2. Find the MPC's IP address in **Preferences**: on the Wi-Fi tab (hold Shift to see it) or the Ethernet tab.
 3. Put the MPC and your computer on the same network, then run the installer with the address and restart
    Claude Desktop:
